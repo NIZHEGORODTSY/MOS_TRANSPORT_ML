@@ -1,0 +1,48 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# --- Окружения и секреты ---
+.venv/
+venv/
+env/
+.env
+.env.*
+
+# --- IDE / ОС ---
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Логи обучения CatBoost ---
+catboost_info/
+
+# --- Данные раздачи (лежат вне репозитория, в ../train, ../test, ../validate, ../labels) ---
+/data/
+*.tar
+train/
+test/
+validate/
+labels/
+
+# --- Временные файлы ---
+*.log
+*.tmp
+*.pkl
+artifacts/_*
+
+# --- Сборка документации (Sphinx) ---
+docs/_build/
+
+# Модель (artifacts/model, ~3 МБ) и artifacts/submission.csv намеренно НЕ игнорируются:
+# сервис должен подниматься без 30-минутного переобучения.
+
+# Вложенный пустой git-репозиторий (случайный `git init`), не часть проекта
+/MOS_TRANSPORT_ML/
