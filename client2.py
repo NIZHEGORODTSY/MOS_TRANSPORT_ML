@@ -1,26 +1,53 @@
 """
-Клиент: спрашивает у пользователя tr_id, маршрут, остановку и время,
-отправляет на /predict только подходящие строки.
-
-Особенности:
-  - tr_id и route_id трактуются как СТРОКИ (могут быть составные, напр. "122048_1767732900")
-  - target_stop_id — тоже строка (крупные числа)
-  - время фильтруется гибко: 'now', точное значение, '-' (пропустить)
+Клиент: сначала строит контекст из traffic_test.csv + schedule_test.csv,
+потом спрашивает tr_id / маршрут / остановку / время
+и отправляет отфильтрованные точки на /predict.
 """
 
+import math
 import sys
 from datetime import datetime
 
+import numpy as np
 import pandas as pd
 import requests
 
 BASE = "http://5.227.60.94:548"
-TIMEOUT = 60
+TIMEOUT_SET_CONTEXT = 180
+TIMEOUT_PREDICT = 60
+
+# ↓↓↓ ЗДЕСЬ БЫЛИ ЗАМЕНЫ ↓↓↓
+TRAFFIC_CSV = "traffic_test.csv"
+SCHEDULE_CSV = "schedule_test.csv"
+POINTS_CSV = "points.csv"
+
+
+# ──────────────────────────── САНИТАЙЗЕР ────────────────────────────
+
+def sanitize(obj):
+    if isinstance(obj, dict):
+        return {k: sanitize(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [sanitize(v) for v in obj]
+    if isinstance(obj, float):
+        return None if (math.isnan(obj) or math.isinf(obj)) else obj
+    if isinstance(obj, np.floating):
+        f = float(obj)
+        return None if (math.isnan(f) or math.isinf(f)) else f
+    if isinstance(obj, np.integer):
+        return int(obj)
+    if isinstance(obj, np.bool_):
+        return bool(obj)
+    if isinstance(obj, pd.Timestamp):
+        return obj.isoformat() if pd.notna(obj) else None
+    if obj is pd.NaT:
+        return None
+    return obj
 
 
 # ──────────────────────────── ВВОД ────────────────────────────
 
-def ask_str(prompt: str) -> str:
+def ask_str(prompt):
     while True:
         raw = input(prompt).strip()
         if raw:
@@ -28,8 +55,7 @@ def ask_str(prompt: str) -> str:
         print("  пусто, попробуй ещё раз")
 
 
-def ask_time(prompt: str):
-    """Возвращает datetime, 'now' или None (не фильтровать)."""
+def ask_time(prompt):
     while True:
         raw = input(prompt).strip()
         low = raw.lower()
@@ -45,13 +71,123 @@ def ask_time(prompt: str):
                 return datetime.strptime(raw, fmt)
             except ValueError:
                 continue
-        print(f"  не могу разобрать '{raw}'. Форматы: "
-              f"'2026-09-27 14:30:00', 'now', '-' (пропустить)")
+        print(f"  не могу разобрать '{raw}'")
 
 
-# ──────────────────────────── ЗАГРУЗКА ────────────────────────────
+# ──────────────────────────── ЭТАП 1: HEALTH ────────────────────────────
 
-def load_points(path="points.csv") -> pd.DataFrame:
+def do_health():
+    print("=" * 60)
+    print("ЭТАП 1: GET /health")
+    print("=" * 60)
+    try:
+        r = requests.get(f"{BASE}/health", timeout=10)
+        print(f"HTTP {r.status_code}")
+        print(r.json())
+    except requests.RequestException as e:
+        print(f"❌ {e}")
+        sys.exit(1)
+
+
+# ──────────────────────────── ЭТАП 2: SET_CONTEXT ────────────────────────────
+
+def do_set_context():
+    print()
+    print("=" * 60)
+    print("ЭТАП 2: POST /set_context")
+    print("=" * 60)
+
+    print(f"[traffic] читаю {TRAFFIC_CSV}")
+    traffic_df = pd.read_csv(TRAFFIC_CSV)
+    print(f"[traffic] прочитано {len(traffic_df)} строк, колонки: {list(traffic_df.columns)}")
+
+    print(f"[schedule] читаю {SCHEDULE_CSV}")
+    schedule_df = pd.read_csv(SCHEDULE_CSV)
+    print(f"[schedule] прочитано {len(schedule_df)} строк, колонки: {list(schedule_df.columns)}")
+
+    # обязательные колонки traffic
+    req_t = ["tr_id", "event_time", "lon", "lat"]
+    miss_t = [c for c in req_t if c not in traffic_df.columns]
+    if miss_t:
+        print(f"❌ в {TRAFFIC_CSV} нет колонок: {miss_t}")
+        sys.exit(1)
+
+    # обязательные колонки schedule
+    req_s = ["tr_id", "tt_action_item_id", "time_begin"]
+    miss_s = [c for c in req_s if c not in schedule_df.columns]
+    if miss_s:
+        print(f"❌ в {SCHEDULE_CSV} нет колонок: {miss_s}")
+        sys.exit(1)
+
+    # чистка traffic
+    traffic_df["tr_id"] = pd.to_numeric(traffic_df.tr_id, errors="coerce")
+    traffic_df["lon"] = pd.to_numeric(traffic_df.lon, errors="coerce")
+    traffic_df["lat"] = pd.to_numeric(traffic_df.lat, errors="coerce")
+    before = len(traffic_df)
+    traffic_df = traffic_df.dropna(subset=["tr_id", "lon", "lat", "event_time"])
+    print(f"[traffic] после чистки: {len(traffic_df)} (выкинуто {before - len(traffic_df)})")
+    traffic_df["tr_id"] = traffic_df.tr_id.astype(np.int64)
+
+    # чистка schedule
+    schedule_df["tr_id"] = pd.to_numeric(schedule_df.tr_id, errors="coerce")
+    schedule_df["tt_action_item_id"] = pd.to_numeric(schedule_df.tt_action_item_id, errors="coerce")
+    before = len(schedule_df)
+    schedule_df = schedule_df.dropna(subset=["tr_id", "tt_action_item_id", "time_begin"])
+    print(f"[schedule] после чистки: {len(schedule_df)} (выкинуто {before - len(schedule_df)})")
+    schedule_df["tr_id"] = schedule_df.tr_id.astype(np.int64)
+    schedule_df["tt_action_item_id"] = schedule_df.tt_action_item_id.astype(np.int64)
+
+    if len(traffic_df) == 0 or len(schedule_df) == 0:
+        print("❌ после чистки остались пустые данные")
+        sys.exit(1)
+
+    traffic_cols = [c for c in [
+        "tr_id", "event_time", "receive_time", "lon", "lat",
+        "speed", "heading", "location_valid",
+    ] if c in traffic_df.columns]
+
+    schedule_cols = [c for c in [
+        "tt_action_item_id", "tr_id", "time_begin",
+        "geom", "building_address", "manual_fill",
+    ] if c in schedule_df.columns]
+
+    traffic_payload = sanitize(traffic_df[traffic_cols].to_dict(orient="records"))
+    schedule_payload = sanitize(schedule_df[schedule_cols].to_dict(orient="records"))
+
+    print(f"[traffic]  к отправке: {len(traffic_payload)}")
+    print(f"[schedule] к отправке: {len(schedule_payload)}")
+    print(f"[traffic]  образец: {traffic_payload[0]}")
+    print(f"[schedule] образец: {schedule_payload[0]}")
+
+    try:
+        r = requests.post(
+            f"{BASE}/set_context",
+            json={"traffic": traffic_payload, "schedule": schedule_payload},
+            timeout=TIMEOUT_SET_CONTEXT,
+        )
+    except requests.exceptions.InvalidJSONError as e:
+        print(f"❌ JSON невалиден: {e}")
+        sys.exit(1)
+    except requests.RequestException as e:
+        print(f"❌ {e}")
+        sys.exit(1)
+
+    print(f"HTTP {r.status_code}")
+    if r.status_code >= 400:
+        print("❌ Сервер вернул ошибку:")
+        print(r.text[:3000])
+        sys.exit(1)
+
+    data = r.json()
+    print(f"✅ Контекст построен: n_vehicles={data.get('n_vehicles')}, "
+          f"elapsed={data.get('elapsed_sec')} s")
+
+
+# ──────────────────────────── ЗАГРУЗКА POINTS ────────────────────────────
+
+def load_points(path=POINTS_CSV):
+    print()
+    print(f"[points] читаю {path}")
     df = pd.read_csv(path)
     print(f"[points] прочитано {len(df)} строк, колонки: {list(df.columns)}")
 
@@ -62,32 +198,24 @@ def load_points(path="points.csv") -> pd.DataFrame:
         print(f"❌ нет колонок: {missing}")
         sys.exit(1)
 
-    # tr_id / target_stop_id — как строки
     df["tr_id"] = df["tr_id"].astype(str)
     df["target_stop_id"] = df["target_stop_id"].astype(str)
-
-    # cur_dev_s — числовой
     df["cur_dev_s"] = pd.to_numeric(df["cur_dev_s"], errors="coerce")
-
-    # ВАЖНО: обращаемся через df["T"], а не df.T (это transpose!)
     df["T_dt"] = pd.to_datetime(df["T"], errors="coerce")
     df["target_time_begin_dt"] = pd.to_datetime(df["target_time_begin"], errors="coerce")
 
     before = len(df)
     df = df.dropna(subset=["cur_dev_s", "T_dt", "target_time_begin_dt"])
-    print(f"[points] после чистки NaN: {len(df)} (выкинуто {before - len(df)})")
-
+    print(f"[points] после чистки: {len(df)} (выкинуто {before - len(df)})")
     if len(df) == 0:
         print("❌ после чистки ничего не осталось")
         sys.exit(1)
-
     return df.reset_index(drop=True)
 
 
 # ──────────────────────────── ФИЛЬТРАЦИЯ ────────────────────────────
 
-def filter_rows(df: pd.DataFrame, tr_id: str, route_id: str,
-                stop_id: str, when) -> pd.DataFrame:
+def filter_rows(df, tr_id, route_id, stop_id, when):
     print()
     print("─" * 60)
     print(f"  Фильтр: tr_id={tr_id!r}, route_id={route_id!r}, "
@@ -97,31 +225,29 @@ def filter_rows(df: pd.DataFrame, tr_id: str, route_id: str,
     cur = df.copy()
     print(f"старт: {len(cur)}")
 
-    # 1) автобус — точное совпадение по строке, либо префикс до '_'
-    tr_exact = cur[cur["tr_id"] == tr_id]
-    if len(tr_exact) > 0:
-        cur = tr_exact
+    # 1) tr_id
+    exact = cur[cur["tr_id"] == tr_id]
+    if len(exact) > 0:
+        cur = exact
         print(f"после tr_id == {tr_id!r}: {len(cur)}")
     else:
-        # вдруг передали только числовую часть, а в файле "122048_..."
-        prefix_mask = cur["tr_id"].str.split("_").str[0] == tr_id
-        if prefix_mask.any():
-            cur = cur[prefix_mask]
+        prefix = cur["tr_id"].str.split("_").str[0] == tr_id
+        if prefix.any():
+            cur = cur[prefix]
             print(f"после tr_id startswith {tr_id!r}: {len(cur)}")
         else:
             print(f"⚠️  ни одна строка не совпала с tr_id={tr_id!r}")
-            print(f"   примеры tr_id в файле: {cur['tr_id'].head(5).tolist()}")
+            print(f"   примеры: {cur['tr_id'].head(5).tolist()}")
             sys.exit(1)
 
-    # 2) маршрут — если колонка есть
+    # 2) маршрут (если колонка есть)
     route_col = None
     for c in ("route_id", "route_num", "route"):
         if c in cur.columns:
             route_col = c
             break
     if route_col is None:
-        print(f"⚠️  колонки с маршрутом нет. "
-              f"Если маршрут зашит в tr_id — фильтр уже отработал.")
+        print("⚠️  колонки с маршрутом нет — пропускаю")
     else:
         cur[route_col] = cur[route_col].astype(str)
         before = len(cur)
@@ -134,7 +260,7 @@ def filter_rows(df: pd.DataFrame, tr_id: str, route_id: str,
     print(f"после target_stop_id == {stop_id!r}: {len(cur)} (было {before})")
 
     if len(cur) == 0:
-        print("❌ после фильтрации не осталось строк")
+        print("❌ после фильтрации пусто")
         print(f"   tr_id в файле: {df['tr_id'].unique()[:10].tolist()}")
         print(f"   target_stop_id в файле: {df['target_stop_id'].unique()[:10].tolist()}")
         sys.exit(1)
@@ -147,7 +273,7 @@ def filter_rows(df: pd.DataFrame, tr_id: str, route_id: str,
             idx = delta.idxmin()
             cur = cur.loc[[idx]]
             print(f"после 'now': выбрана ближайшая (T={cur.iloc[0]['T']}, "
-                  f"отклонение={delta[idx]})")
+                  f"откл={delta[idx]})")
         else:
             target_ts = pd.Timestamp(when)
             delta = (cur["T_dt"] - target_ts).abs()
@@ -156,7 +282,7 @@ def filter_rows(df: pd.DataFrame, tr_id: str, route_id: str,
             if len(narrowed) == 0:
                 idxs = delta.nsmallest(min(5, len(cur))).index
                 cur = cur.loc[idxs]
-                print(f"±10 мин пусто → беру 5 ближайших по T")
+                print(f"±10 мин пусто → беру 5 ближайших")
             else:
                 cur = narrowed
                 print(f"после окна ±10 мин от {when}: {len(cur)}")
@@ -164,11 +290,12 @@ def filter_rows(df: pd.DataFrame, tr_id: str, route_id: str,
     return cur.reset_index(drop=True)
 
 
-# ──────────────────────────── MAIN ────────────────────────────
+# ──────────────────────────── ЭТАП 3: PREDICT ────────────────────────────
 
-def main():
+def do_predict():
+    print()
     print("=" * 60)
-    print("  ПРЕДСКАЗАНИЕ ЗАДЕРЖКИ АВТОБУСА")
+    print("ЭТАП 3: POST /predict")
     print("=" * 60)
 
     tr_id = ask_str("Номер автобуса (tr_id): ")
@@ -181,18 +308,12 @@ def main():
 
     print()
     print(f"✅ Отобрано {len(selected)} строк")
-    first = selected.iloc[0]
-    print(f"   образец: sample_id={first['sample_id']} "
-          f"tr_id={first['tr_id']} T={first['T']} "
-          f"target_stop_id={first['target_stop_id']} "
-          f"cur_dev_s={first['cur_dev_s']}")
 
     payload = selected[[
         "sample_id", "tr_id", "T", "target_stop_id",
         "target_time_begin", "cur_dev_s",
     ]].to_dict(orient="records")
 
-    # явное приведение типов, чтобы никакие numpy.* не просочились
     for row in payload:
         row["sample_id"] = str(row["sample_id"])
         row["tr_id"] = str(row["tr_id"])
@@ -203,9 +324,9 @@ def main():
 
     try:
         r = requests.post(f"{BASE}/predict",
-                          json={"points": payload}, timeout=TIMEOUT)
+                          json={"points": payload}, timeout=TIMEOUT_PREDICT)
     except requests.RequestException as e:
-        print(f"❌ Ошибка запроса: {e}")
+        print(f"❌ {e}")
         sys.exit(1)
 
     print(f"HTTP {r.status_code}")
@@ -221,6 +342,22 @@ def main():
     print("=" * 60)
     for sid, p in zip(data["sample_id"], data["prediction"]):
         print(f"   {sid}: {p} s")
+
+
+# ──────────────────────────── MAIN ────────────────────────────
+
+def main():
+    print("=" * 60)
+    print("  ПРЕДСКАЗАНИЕ ЗАДЕРЖКИ АВТОБУСА")
+    print(f"  traffic={TRAFFIC_CSV}  schedule={SCHEDULE_CSV}  points={POINTS_CSV}")
+    print("=" * 60)
+
+    do_health()
+    do_set_context()
+    do_predict()
+
+    print()
+    print("✅ Готово")
 
 
 if __name__ == "__main__":
